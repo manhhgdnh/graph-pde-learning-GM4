@@ -3,270 +3,174 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.sparse import csr_matrix, issparse
 from sklearn.neighbors import NearestNeighbors
-from data import extract_patches
+
+from .data import extract_patches
+
 
 @dataclass
 class GraphData:
-    """
-    Weighted undirected graph represented by a sparse weight matrix.
-
-    The vertex set is V = {0, ..., n_nodes - 1}.
-
-    An edge (u, v) exists if and only if weights[u, v] > 0.
-
-    The matrix is expected to be:
-    - square,
-    - symmetric,
-    - with zero diagonal,
-    - with strictly positive stored weights.
-    """
-
     weights: csr_matrix
 
     def __post_init__(self) -> None:
         if not issparse(self.weights):
             raise TypeError("weights must be a scipy sparse matrix.")
 
-        W = self.weights.tocsr(copy=True)
-        n, m = W.shape
+        if np.iscomplexobj(self.weights.data):
+            raise TypeError("Graph weights must be real.")
 
-        # Merge possible duplicated sparse entries.
+        W = self.weights.tocsr(copy=True).astype(float)
         W.sum_duplicates()
-
-        # Remove explicitly stored zeros.
         W.eliminate_zeros()
-
-        # Canonical ordering of column indices.
         W.sort_indices()
 
-        if W.ndim != 2:
-            raise ValueError("weights must be a matrix.")
-
-        if n != m:
-            raise ValueError("weights must be a square matrix.")
+        if W.shape[0] != W.shape[1] or W.shape[0] == 0:
+            raise ValueError("weights must be a non-empty square matrix.")
 
         if not np.all(np.isfinite(W.data)):
             raise ValueError("Graph weights must be finite.")
 
         if np.any(W.data <= 0):
-            raise ValueError(
-                "Stored graph weights must be strictly positive."
-            )
+            raise ValueError("Stored weights must be strictly positive.")
 
         if np.any(W.diagonal() != 0):
-            raise ValueError(
-                "Graph diagonal must be zero."
-            )
+            raise ValueError("The graph diagonal must be zero.")
+
+        if (W - W.T).nnz != 0:
+            raise ValueError("Graph weights must be symmetric.")
 
         self.weights = W
-    
+
     @property
     def n_nodes(self) -> int:
         return self.weights.shape[0]
-    
+
     @property
     def n_edges(self) -> int:
         return self.weights.nnz // 2
 
-    def _check_vertex(self, u : int) -> None:
+    def _check_vertex(self, u: int) -> None:
+        if isinstance(u, (bool, np.bool_)):
+            raise TypeError("Vertex indices must be integers.")
+
         if not isinstance(u, (int, np.integer)):
-            raise TypeError(
-                "Vertex index must be an integer."
-        )
+            raise TypeError("Vertex indices must be integers.")
 
         if u < 0 or u >= self.n_nodes:
-            raise IndexError(
-                f"Vertex {u} is out of range."
-        )
+            raise IndexError("Vertex index is out of range.")
 
-
-    def degree(self, u:int) -> int:
-        self._check_vertex(u)
-
-        return (
-            self.weights.indptr[u+1] - self.weights.indptr[u]
-        )
-    
-    def weighted_degree(self, u: int) -> float:
-        self._check_vertex(u)
-
-        start = self.weights.indptr[u]
-        end = self.weights.indptr[u+1]
-
-        return float(
-            np.sum(self.weights.data[start:end])
-        )
-
-    def neighbors(
-        self, 
-        u : int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-
+    def neighbors(self, u: int) -> tuple[np.ndarray, np.ndarray]:
         self._check_vertex(u)
 
         start = self.weights.indptr[u]
         end = self.weights.indptr[u + 1]
 
-        indices = self.weights.indices[start:end]
-        weights = self.weights.data[start:end]
+        return (
+            self.weights.indices[start:end],
+            self.weights.data[start:end],
+        )
 
-        return indices, weights
-        
+    def degree(self, u: int) -> int:
+        neighbors, _ = self.neighbors(u)
+        return neighbors.size
+
+    def weighted_degree(self, u: int) -> float:
+        _, weights = self.neighbors(u)
+        return float(weights.sum())
+
+
+def _check_integer(value: int, name: str, minimum: int = 1) -> None:
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be an integer.")
+
+    if not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be an integer.")
+
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}.")
+
+
+def _point_features(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=float)
+
+    if X.ndim != 2 or min(X.shape) == 0:
+        raise ValueError("X must be a non-empty feature matrix.")
+
+    if not np.all(np.isfinite(X)):
+        raise ValueError("X must contain finite values.")
+
+    return X
+
+
+def _make_graph(rows, cols, n_nodes: int) -> GraphData:
+    rows = np.asarray(rows, dtype=int)
+    cols = np.asarray(cols, dtype=int)
+
+    W = csr_matrix(
+        (np.ones(rows.size), (rows, cols)),
+        shape=(n_nodes, n_nodes),
+    )
+    W.sum_duplicates()
+    W.data[:] = 1.0
+
+    W = W.maximum(W.T)
+    W.setdiag(0)
+    W.eliminate_zeros()
+
+    return GraphData(W)
+
 
 def build_knn_graph(
     X: np.ndarray,
     k: int = 10,
 ) -> GraphData:
-    """
-    Build an undirected k-nearest-neighbor graph.
+    X = _point_features(X)
+    _check_integer(k, "k")
 
-    The directed k-NN relation is symmetrized using the union rule:
-
-        (u, v) is an edge if
-        v is among the k nearest neighbors of u
-        OR
-        u is among the k nearest neighbors of v.
-
-    Constant weights equal to 1 are used in this block.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        Data matrix of shape (n_samples, n_features).
-
-    k : int
-        Number of nearest neighbors used for each vertex.
-
-    Returns
-    -------
-    GraphData
-        Undirected sparse k-NN graph.
-    """
-    
-    X = np.asarray(X)
     n_samples = X.shape[0]
 
-    if X.ndim != 2:
-        raise ValueError(
-            "X must have shape "
-            "(n_samples, n_features)."
-        )
-    
-    if k < 1:
-        raise ValueError(
-            "k must be at least 1."
-        )
-    
-
     if k >= n_samples:
-        raise ValueError(
-            "k must be strictly smaller "
-            "than the number of samples."
-        )
-    
-    nn = NearestNeighbors(
-        n_neighbors=k+1,
+        raise ValueError("k must be smaller than the number of samples.")
+
+    model = NearestNeighbors(
+        n_neighbors=k + 1,
         metric="euclidean",
     )
+    model.fit(X)
 
-    nn.fit(X)
-
-    raw_neighbors = nn.kneighbors(
+    raw_neighbors = model.kneighbors(
         X,
         return_distance=False,
     )
 
-    neighbors = np.empty(
-        (n,samples, k),
-        dtype=int,
-    )
+    neighbors = np.empty((n_samples, k), dtype=int)
 
     for u in range(n_samples):
         candidates = raw_neighbors[u]
         candidates = candidates[candidates != u]
-    
         neighbors[u] = candidates[:k]
 
-
-    rows = np.repeat(
-        np.arange(n_samples),
-        k,
-    )
-
+    rows = np.repeat(np.arange(n_samples), k)
     cols = neighbors.ravel()
 
-    data = np.ones(
-        len(rows),
-        dtype=float,
-    )
-
-    directed = csr_matrix(
-        (data, (rows, cols)),
-        shape=(n_samples, n_samples),
-    )
-
-    weights = directed.maximum(directed.T)
-    weights.setdiag(0)
-    weights.eliminate_zeros()
-    weights.sort_indices()
-
-    return GraphData(weights=weights)
+    return _make_graph(rows, cols, n_samples)
 
 
 def build_epsilon_graph(
     X: np.ndarray,
     epsilon: float,
 ) -> GraphData:
-    """
-    Build an undirected epsilon-neighborhood graph.
+    X = _point_features(X)
 
-    Two distinct vertices u and v are connected if
+    if not np.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError("epsilon must be finite and positive.")
 
-        ||X[u] - X[v]||_2 <= epsilon.
-
-    Constant weights equal to 1 are used in this block.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        Data matrix of shape (n_samples, n_features).
-
-    epsilon : float
-        Neighborhood radius. Must be strictly positive.
-
-    Returns
-    -------
-    GraphData
-        Undirected sparse epsilon-neighborhood graph.
-    """
-
-    X = np.asarray(X)
-    n_samples = X.shape[0]
-
-    if X.ndim != 2:
-        raise ValueError(
-            "X must have shape "
-            "(n_samples, n_features)."
-        )
-
-    if n_samples == 0:
-        raise ValueError(
-            "X must contain at least one sample."
-        )
-
-    if epsilon <= 0:
-        raise ValueError(
-            "epsilon must be strictly positive."
-        )
-
-    nn = NearestNeighbors(
+    model = NearestNeighbors(
         radius=epsilon,
         metric="euclidean",
     )
+    model.fit(X)
 
-    nn.fit(X)
-
-    neighborhoods = nn.radius_neighbors(
+    neighborhoods = model.radius_neighbors(
         X,
         return_distance=False,
     )
@@ -275,349 +179,133 @@ def build_epsilon_graph(
     cols = []
 
     for u, candidates in enumerate(neighborhoods):
-
         candidates = candidates[candidates != u]
-
-        rows.extend([u] * len(candidates))
-
+        rows.extend([u] * candidates.size)
         cols.extend(candidates.tolist())
 
-    if len(rows) == 0:
+    return _make_graph(rows, cols, X.shape[0])
 
-        weights = csr_matrix(
-            (n_samples, n_samples),
-            dtype=float,
-        )
-
-    else:
-
-        rows = np.asarray(
-            rows,
-            dtype=int,
-        )
-
-        cols = np.asarray(
-            cols,
-            dtype=int,
-        )
-
-        data = np.ones(
-            len(rows),
-            dtype=float,
-        )
-
-        weights = csr_matrix(
-            (data, (rows, cols)),
-            shape=(
-                n_samples,
-                n_samples,
-            ),
-        )
-
-    # The epsilon relation should already be symmetric
-    # for a symmetric metric, but we enforce it explicitly
-    # to satisfy the GraphData contract.
-    
-    weights = weights.maximum(weights.T)
-
-    weights.setdiag(0)
-    weights.eliminate_zeros()
-    weights.sort_indices()
-
-    return GraphData(weights=weights)
 
 def build_grid_graph(
     image: np.ndarray,
     connectivity: int = 4,
 ) -> GraphData:
-    """
-    Build a graph from a 2D image grid.
-
-    Each pixel corresponds to one graph vertex.
-
-    Vertex indexing follows row-major order:
-
-        u = i * width + j
-
-    where (i, j) is the pixel coordinate.
-
-    Parameters
-    ----------
-    image : np.ndarray
-        Grayscale image of shape (H, W) or
-        color image of shape (H, W, C).
-
-    connectivity : {4, 8}
-        Pixel neighborhood connectivity.
-
-    Returns
-    -------
-    GraphData
-        Sparse undirected image grid graph with
-        constant edge weights equal to 1.
-    """
-
     image = np.asarray(image)
-    height, width = image.shape[:2]
 
-    if image.ndim not in (2, 3):
-        raise ValueError(
-            "image must have shape (H, W) "
-            "or (H, W, C)."
-        )
-
-
-    if height == 0 or width == 0:
-        raise ValueError(
-            "image dimensions must be non-zero."
-        )
+    if image.ndim not in (2, 3) or image.size == 0:
+        raise ValueError("image must be a non-empty grayscale or color image.")
 
     if connectivity not in (4, 8):
-        raise ValueError(
-            "connectivity must be either 4 or 8."
-        )
+        raise ValueError("connectivity must be 4 or 8.")
 
-    n_nodes = height * width
+    height, width = image.shape[:2]
+
+    offsets = [(0, 1), (1, 0)]
+
+    if connectivity == 8:
+        offsets.extend([(1, 1), (1, -1)])
 
     rows = []
     cols = []
 
-    def vertex(i: int, j: int) -> int:
-        return i * width + j
-
     for i in range(height):
         for j in range(width):
+            u = i * width + j
 
-            u = vertex(i, j)
+            for di, dj in offsets:
+                ni = i + di
+                nj = j + dj
 
-            # Right neighbor
-            if j + 1 < width:
+                if 0 <= ni < height and 0 <= nj < width:
+                    v = ni * width + nj
+                    rows.append(u)
+                    cols.append(v)
 
-                v = vertex(i, j + 1)
+    return _make_graph(rows, cols, height * width)
 
-                rows.extend([u, v])
-                cols.extend([v, u])
-
-            # Bottom neighbor
-            if i + 1 < height:
-
-                v = vertex(i + 1, j)
-
-                rows.extend([u, v])
-                cols.extend([v, u])
-
-            if connectivity == 8:
-
-                # Bottom-right diagonal
-                if (
-                    i + 1 < height
-                    and j + 1 < width
-                ):
-
-                    v = vertex(
-                        i + 1,
-                        j + 1,
-                    )
-
-                    rows.extend([u, v])
-                    cols.extend([v, u])
-
-                # Bottom-left diagonal
-                if (
-                    i + 1 < height
-                    and j - 1 >= 0
-                ):
-
-                    v = vertex(
-                        i + 1,
-                        j - 1,
-                    )
-
-                    rows.extend([u, v])
-                    cols.extend([v, u])
-
-    if len(rows) == 0:
-
-        weights = csr_matrix(
-            (n_nodes, n_nodes),
-            dtype=float,
-        )
-
-    else:
-
-        rows = np.asarray(
-            rows,
-            dtype=int,
-        )
-
-        cols = np.asarray(
-            cols,
-            dtype=int,
-        )
-
-        data = np.ones(
-            len(rows),
-            dtype=float,
-        )
-
-        weights = csr_matrix(
-            (data, (rows, cols)),
-            shape=(
-                n_nodes,
-                n_nodes,
-            ),
-        )
-
-    weights.eliminate_zeros()
-    weights.sort_indices()
-
-    return GraphData(weights=weights)
 
 def _prepare_features(
     features: np.ndarray,
     n_nodes: int,
 ) -> np.ndarray:
-    """
-    Convert point-cloud or image attributes to a matrix
-    of shape (n_nodes, n_features).
-    """
+    F = np.asarray(features, dtype=float)
 
-    F = np.asarray(
-        features,
-        dtype=float,
-    )
+    if F.ndim == 1 and F.size == n_nodes:
+        F = F.reshape(n_nodes, 1)
 
-    if F.ndim == 1:
-        return F.reshape(
-            n_nodes,
-            1,
-        )
-
-    if F.ndim == 2:
-
-        # Standard point-cloud / feature matrix.
+    elif F.ndim == 2:
         if F.shape[0] == n_nodes:
-            return F
+            pass
+        elif F.size == n_nodes:
+            F = F.reshape(n_nodes, 1)
+        else:
+            raise ValueError("features do not match the graph.")
 
-        # Grayscale image.
-        if F.size == n_nodes:
-            return F.reshape(
-                n_nodes,
-                1,
-            )
+    elif F.ndim == 3 and F.shape[0] * F.shape[1] == n_nodes:
+        F = F.reshape(n_nodes, F.shape[2])
 
-    if F.ndim == 3:
+    else:
+        raise ValueError("features do not match the graph.")
 
-        height, width, channels = F.shape
+    if F.shape[1] == 0 or not np.all(np.isfinite(F)):
+        raise ValueError("features must be non-empty and finite.")
 
-        return F.reshape(
-            n_nodes,
-            channels,
-        )
+    return F
+
 
 def _edge_distances(
     features: np.ndarray,
     graph: GraphData,
     metric: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute distances only for existing graph edges.
-    """
-
     W = graph.weights
 
-    degrees = np.diff(W.indptr)
-
     rows = np.repeat(
-        np.arange(W.shape[0]),
-        degrees,
+        np.arange(graph.n_nodes),
+        np.diff(W.indptr),
     )
-
     cols = W.indices
 
-    differences = (
-        features[rows]
-        - features[cols]
-    )
-
-    absolute = np.abs(differences)
+    differences = features[rows] - features[cols]
 
     if metric == "euclidean":
-
-        distances = np.sqrt(
-            np.sum(
-                differences ** 2,
-                axis=1,
-            )
-        )
-
+        distances = np.sqrt(np.sum(differences ** 2, axis=1))
     elif metric == "manhattan":
-
-        distances = np.sum(
-            absolute,
-            axis=1,
-        )
-
+        distances = np.sum(np.abs(differences), axis=1)
     elif metric == "chebyshev":
-
-        distances = np.max(
-            absolute,
-            axis=1,
-        )
-
+        distances = np.max(np.abs(differences), axis=1)
     else:
-        raise ValueError(
-            "metric must be 'euclidean', "
-            "'manhattan' or 'chebyshev'."
-        )
+        raise ValueError("Unknown distance metric.")
 
     return rows, cols, distances
+
 
 def _local_scales(
     features: np.ndarray,
     m: int,
     metric: str,
 ) -> np.ndarray:
-    """
-    Compute local scales sigma_u as the distance
-    to the M-th nearest neighbor.
-    """
+    _check_integer(m, "local_scale_m")
 
-    n_nodes = features.shape[0]
+    if m >= features.shape[0]:
+        raise ValueError("local_scale_m must be smaller than n_nodes.")
 
-    if m < 1 or m >= n_nodes:
-        raise ValueError(
-            "local_scale_m must satisfy "
-            "1 <= M < n_nodes."
-        )
-
-    nn = NearestNeighbors(
+    model = NearestNeighbors(
         n_neighbors=m + 1,
         metric=metric,
     )
+    model.fit(features)
 
-    nn.fit(features)
+    distances, indices = model.kneighbors(features)
+    sigma = np.empty(features.shape[0])
 
-    distances, indices = nn.kneighbors(features)
-
-    sigma = np.empty(
-        n_nodes,
-        dtype=float,
-    )
-
-    for u in range(n_nodes):
-
-        mask = (indices[u] != u)
-
-        local_distances = (distances[u][mask])
-
-        sigma[u] = (local_distances[m - 1])
+    for u in range(features.shape[0]):
+        candidates = distances[u][indices[u] != u]
+        sigma[u] = candidates[m - 1]
 
     if np.any(sigma <= 0):
         raise ValueError(
-            "Some local scales are zero. "
-            "This can occur with duplicated data points; "
-            "choose a larger M or preprocess duplicates."
+            "Local scales are zero. Check duplicates or increase local_scale_m."
         )
 
     return sigma
@@ -632,102 +320,38 @@ def compute_weights(
     sigma: float | None = None,
     local_scale_m: int = 7,
 ) -> GraphData:
-    """
-    Compute graph edge weights while preserving the topology.
-
-    Modes
-    -----
-    constant
-        w_uv = 1
-
-    gaussian_global
-        w_uv = exp(-d(u,v)^2 / sigma^2)
-
-    gaussian_local
-        w_uv = exp(
-            -d(u,v)^2 / (sigma_u * sigma_v)
-        )
-
-        where sigma_u is the distance from u to its
-        M-th nearest neighbor.
-    """
-
     W = graph.weights.copy()
 
     if mode == "constant":
-
         W.data[:] = 1.0
-
-        return GraphData(weights=W)
+        return GraphData(W)
 
     if features is None:
-        raise ValueError(
-            "features are required for "
-            "Gaussian weights."
-        )
+        raise ValueError("features are required for Gaussian weights.")
 
-    F = _prepare_features(
-        features,
-        graph.weights.shape[0],
-    )
-
-    rows, cols, distances = _edge_distances(
-        F,
-        graph,
-        metric,
-    )
+    F = _prepare_features(features, graph.n_nodes)
+    rows, cols, distances = _edge_distances(F, graph, metric)
 
     if mode == "gaussian_global":
+        if sigma is None or not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError("sigma must be finite and positive.")
 
-        if sigma is None:
-            raise ValueError(
-                "sigma must be provided for "
-                "gaussian_global weights."
-            )
-
-        new_weights = np.exp(
-            -(distances ** 2)
-            / (sigma ** 2)
-        )
+        denominator = sigma ** 2
 
     elif mode == "gaussian_local":
-
-        local_sigma = _local_scales(
-            F,
-            local_scale_m,
-            metric,
-        )
-
-        denominator = (
-            local_sigma[rows]
-            * local_sigma[cols]
-        )
-
-        new_weights = np.exp(
-            -(distances ** 2)
-            / denominator
-        )
+        scales = _local_scales(F, local_scale_m, metric)
+        denominator = scales[rows] * scales[cols]
 
     else:
-        raise ValueError(
-            "mode must be 'constant', "
-            "'gaussian_global' or "
-            "'gaussian_local'."
-        )
+        raise ValueError("Unknown weighting mode.")
 
-    # Numerical underflow may produce exact zeros.
-    # Mathematically Gaussian similarities are positive.
-    new_weights = np.maximum(
-        new_weights,
-        np.finfo(float).tiny,
-    )
+    W.data = np.exp(-(distances ** 2) / denominator)
 
-    W.data = new_weights
+    # Keep the prescribed topology when Gaussian weights underflow.
+    W.data = np.maximum(W.data, np.finfo(float).tiny)
 
-    W.eliminate_zeros()
-    W.sort_indices()
+    return GraphData(W)
 
-    return GraphData(weights=W)
 
 def build_patch_graph(
     image: np.ndarray,
@@ -736,133 +360,46 @@ def build_patch_graph(
     k: int = 10,
     patches: np.ndarray | None = None,
 ) -> GraphData:
-    """
-    Build a semi-non-local image graph based on patch similarity.
-
-    For each pixel u:
-    - define a square spatial search window,
-    - compare its patch with the patches inside this window,
-    - connect u to the k most similar patches.
-
-    The directed relation is symmetrized using the union rule.
-
-    Constant weights equal to 1 are initially assigned.
-    Gaussian patch weights can then be computed with
-    compute_weights(...).
-
-    Parameters
-    ----------
-    image : np.ndarray
-        Image of shape (H, W) or (H, W, C).
-
-    patch_size : int
-        Odd width of the patch describing each pixel.
-
-    search_window_size : int
-        Odd width of the spatial search window.
-
-    k : int
-        Number of most similar patches selected
-        inside each search window.
-
-    patches : np.ndarray | None
-        Optional precomputed patch matrix.
-
-    Returns
-    -------
-    GraphData
-        Sparse symmetric semi-non-local graph.
-    """
-
     image = np.asarray(image)
 
-    if image.ndim not in (2, 3):
-        raise ValueError(
-            "image must have shape (H, W) "
-            "or (H, W, C)."
-        )
+    if image.ndim not in (2, 3) or image.size == 0:
+        raise ValueError("image must be a non-empty grayscale or color image.")
+
+    _check_integer(search_window_size, "search_window_size", 3)
+    _check_integer(k, "k")
+
+    if search_window_size % 2 == 0:
+        raise ValueError("search_window_size must be odd.")
 
     height, width = image.shape[:2]
-
     n_nodes = height * width
 
-    if (
-        search_window_size < 3
-        or search_window_size % 2 == 0
-    ):
-        raise ValueError(
-            "search_window_size must be "
-            "an odd integer >= 3."
-        )
-
-    if k < 1:
-        raise ValueError(
-            "k must be strictly positive."
-        )
-
     if patches is None:
-
-        patches = extract_patches(
-            image,
-            patch_size=patch_size,
-        )
-
+        patches = extract_patches(image, patch_size)
     else:
-        patches = np.asarray(
-            patches,
-            dtype=float,
-        )
+        patches = np.asarray(patches, dtype=float)
 
-        if patches.ndim != 2:
-            raise ValueError(
-                "patches must be a 2D feature matrix."
-            )
+    if patches.ndim != 2 or patches.shape[0] != n_nodes:
+        raise ValueError("patches must contain one feature vector per pixel.")
 
-        if patches.shape[0] != n_nodes:
-            raise ValueError(
-                "patches must contain one "
-                "descriptor per image pixel."
-            )
+    if patches.shape[1] == 0 or not np.all(np.isfinite(patches)):
+        raise ValueError("patches must be non-empty and finite.")
 
     radius = search_window_size // 2
-
     rows = []
     cols = []
 
     for i in range(height):
-
-        i_min = max(
-            0,
-            i - radius,
-        )
-
-        i_max = min(
-            height,
-            i + radius + 1,
-        )
-
         for j in range(width):
-
-            j_min = max(
-                0,
-                j - radius,
-            )
-
-            j_max = min(
-                width,
-                j + radius + 1,
-            )
-
             u = i * width + j
 
             candidate_rows = np.arange(
-                i_min,
-                i_max,
+                max(0, i - radius),
+                min(height, i + radius + 1),
             )
-
             candidate_cols = np.arange(
-                j_min,
-                j_max,
+                max(0, j - radius),
+                min(width, j + radius + 1),
             )
 
             grid_i, grid_j = np.meshgrid(
@@ -871,92 +408,20 @@ def build_patch_graph(
                 indexing="ij",
             )
 
-            candidates = (
-                grid_i * width
-                + grid_j
-            ).ravel()
-
+            candidates = (grid_i * width + grid_j).ravel()
             candidates = candidates[candidates != u]
 
-            if len(candidates) == 0:
+            if candidates.size == 0:
                 continue
 
-            differences = (
-                patches[candidates]
-                - patches[u]
-            )
+            differences = patches[candidates] - patches[u]
+            distances = np.sum(differences ** 2, axis=1)
 
-            distances_squared = np.sum(
-                differences ** 2,
-                axis=1,
-            )
+            order = np.argsort(distances, kind="stable")
+            selected = candidates[order[:min(k, candidates.size)]]
 
-            n_neighbors = min(
-                k,
-                len(candidates),
-            )
+            rows.extend([u] * selected.size)
+            cols.extend(selected.tolist())
 
-            if (
-                n_neighbors
-                < len(candidates)
-            ):
-                selected_positions = np.argpartition(
-                    distances_squared,
-                    n_neighbors - 1,
-                )[:n_neighbors]
+    return _make_graph(rows, cols, n_nodes)
 
-                selected = candidates[
-                    selected_positions
-                ]
-
-            else:
-                selected = candidates
-
-            rows.extend(
-                [u] * len(selected)
-            )
-
-            cols.extend(
-                selected.tolist()
-            )
-
-    if len(rows) == 0:
-
-        weights = csr_matrix(
-            (n_nodes, n_nodes),
-            dtype=float,
-        )
-
-    else:
-        rows = np.asarray(
-            rows,
-            dtype=int,
-        )
-
-        cols = np.asarray(
-            cols,
-            dtype=int,
-        )
-
-        data = np.ones(
-            len(rows),
-            dtype=float,
-        )
-
-        directed = csr_matrix(
-            (data, (rows, cols)),
-            shape=(
-                n_nodes,
-                n_nodes,
-            ),
-        )
-
-        weights = directed.maximum(
-            directed.T
-        )
-
-        weights.setdiag(0)
-        weights.eliminate_zeros()
-        weights.sort_indices()
-
-    return GraphData(weights=weights)

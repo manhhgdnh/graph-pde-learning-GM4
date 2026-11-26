@@ -6,107 +6,86 @@ from PIL import Image
 from sklearn.datasets import make_blobs, make_moons
 from numpy.lib.stride_tricks import sliding_window_view
 
+
 @dataclass
 class Dataset:
-    """
-    Dataset represented by a feature matrix X and optional labels y.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        Feature matrix of shape (n_samples, n_features).
-
-    y : np.ndarray | None
-        Optional label vector of shape (n_samples,).
-    """
-
     X: np.ndarray
     y: np.ndarray | None = None
 
     def __post_init__(self) -> None:
+        self.X = np.asarray(self.X, dtype=float)
+
         if self.X.ndim != 2:
-            raise ValueError(
-                "X must have shape (n_samples, n_features)."
-            )
+            raise ValueError("X must have shape (n_samples, n_features).")
+
+        if min(self.X.shape) == 0:
+            raise ValueError("X must not be empty.")
+
+        if not np.all(np.isfinite(self.X)):
+            raise ValueError("X must contain finite values.")
 
         if self.y is not None:
-            if self.y.ndim != 1:
-                raise ValueError(
-                    "y must be a one-dimensional array."
-                )
+            self.y = np.asarray(self.y)
 
-            if len(self.y) != len(self.X):
-                raise ValueError(
-                    "X and y must contain the same number of samples."
-                )
-    
+            if self.y.shape != (self.X.shape[0],):
+                raise ValueError("y must have shape (n_samples,).")
+
     @property
     def n_samples(self) -> int:
         return self.X.shape[0]
-    
-    @property 
+
+    @property
     def n_features(self) -> int:
         return self.X.shape[1]
 
 
 @dataclass
 class SeedSet:
-    """
-    Set of labelled graph vertices.
-
-    Parameters
-    ----------
-    indices : np.ndarray
-        Vertex indices of shape (n_seeds,).
-
-    labels : np.ndarray
-        Corresponding class labels of shape (n_seeds,).
-    """
-
     indices: np.ndarray
     labels: np.ndarray
 
     def __post_init__(self) -> None:
+        self.indices = np.asarray(self.indices)
+        self.labels = np.asarray(self.labels)
+
         if self.indices.ndim != 1:
-            raise ValueError(
-                "indices must be a one-dimensional array."
-            )
+            raise ValueError("indices must be one-dimensional.")
 
-        if self.labels.ndim != 1:
-            raise ValueError(
-                "labels must be a one-dimensional array."
-            )
+        if self.indices.size == 0:
+            self.indices = self.indices.astype(int)
 
-        if len(self.indices) != len(self.labels):
-            raise ValueError(
-                "indices and labels must have the same length."
-            )
+        if self.indices.dtype.kind not in "iu":
+            raise TypeError("Seed indices must be integers.")
 
-        if len(np.unique(self.indices)) != len(self.indices):
-            raise ValueError(
-                "Seed indices must be unique."
-            )
-    
+        self.indices = self.indices.astype(int, copy=True)
+
+        if self.labels.shape != self.indices.shape:
+            raise ValueError("indices and labels must have the same shape.")
+
+        if np.unique(self.indices).size != self.indices.size:
+            raise ValueError("Seed indices must be unique.")
+
+        if self.labels.dtype.kind in "fc":
+            if not np.all(np.isfinite(self.labels)):
+                raise ValueError("Seed labels must be finite.")
+
     @property
     def n_seeds(self) -> int:
-        return len(self.indices)
+        return self.indices.size
+
 
 def make_two_moons(
     n_samples: int = 500,
     noise: float = 0.08,
     random_state: int | None = None,
 ) -> Dataset:
-    """
-    Generate the classical two-moons classification dataset.
-    """
-    
     X, y = make_moons(
         n_samples=n_samples,
         noise=noise,
         random_state=random_state,
     )
+    return Dataset(X, y)
 
-    return Dataset(X=X, y=y)
 
 def make_point_cloud(
     n_samples: int = 500,
@@ -115,10 +94,6 @@ def make_point_cloud(
     cluster_std: float = 1.0,
     random_state: int | None = None,
 ) -> Dataset:
-    """
-    Generate a synthetic point cloud composed of Gaussian clusters.
-    """
-
     X, y = make_blobs(
         n_samples=n_samples,
         n_features=n_features,
@@ -126,231 +101,121 @@ def make_point_cloud(
         cluster_std=cluster_std,
         random_state=random_state,
     )
+    return Dataset(X, y)
 
-    return Dataset(X=X, y=y)
 
 def select_seeds(
     y: np.ndarray,
     n_per_class: int = 1,
     random_state: int | None = None,
 ) -> SeedSet:
-    """
-    Randomly select the same number of labelled seeds
-    from each class.
-    """
-
     y = np.asarray(y)
+
+    if y.ndim != 1 or y.size == 0:
+        raise ValueError("y must be a non-empty one-dimensional array.")
+
+    if not isinstance(n_per_class, (int, np.integer)):
+        raise TypeError("n_per_class must be an integer.")
+
+    if n_per_class < 1:
+        raise ValueError("n_per_class must be positive.")
+
     rng = np.random.default_rng(random_state)
+    selected = []
 
-    selected_indices = []
-    classes = np.unique(y)
+    for label in np.unique(y):
+        candidates = np.flatnonzero(y == label)
 
-    for label in classes:
-        class_indices = np.flatnonzero(y == label)
+        if candidates.size < n_per_class:
+            raise ValueError("A class contains fewer points than requested.")
 
         chosen = rng.choice(
-            class_indices,
+            candidates,
             size=n_per_class,
             replace=False,
         )
+        selected.extend(chosen.tolist())
 
-        selected_indices.extend(chosen.tolist())
-    
-    indices = np.asarray(
-        selected_indices,
-        dtype=int,
-    )
-    labels = y[indices]
-
-    return SeedSet(
-        indices=indices,
-        labels=labels,
-    )
+    indices = np.asarray(selected, dtype=int)
+    return SeedSet(indices, y[indices])
 
 
 def load_image(
-    path : str | Path,
+    path: str | Path,
     grayscale: bool = False,
 ) -> np.ndarray:
-    """
-    Load an image and return normalized values in [0, 1].
-    """
     path = Path(path)
-    
-    if not path.existe():
-        raise FileNotFoundError(
-            f"Image not found: {path}"
-        )
-    
-    with Image.open(path) as image:
 
-        if grayscale:
-            image = image.convert("L")
-        else :
-            image = image.convert("RGB")
-        
-        array = np.assarray(
-            image,
-            dtype=np.float64,
-        )
+    if not path.is_file():
+        raise FileNotFoundError(f"Image not found: {path}")
+
+    with Image.open(path) as image:
+        mode = "L" if grayscale else "RGB"
+        array = np.asarray(image.convert(mode), dtype=float)
 
     return array / 255.0
 
-def load_dataset(
-    path: str | Path,
-) -> Dataset:
-    """
-    Load a dataset stored in NumPy .npz format.
 
-    The file must contain an array named 'X'.
-    The array 'y' is optional.
-    """
-
+def load_dataset(path: str | Path) -> Dataset:
     path = Path(path)
 
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Dataset not found: {path}"
-        )
-    
-    if path.suffix != ".npz":
-        raise ValueError(
-            "Only .npz datasets are currently supported."
-        )
-    
-    with np.load(path) as data:
+    if not path.is_file():
+        raise FileNotFoundError(f"Dataset not found: {path}")
 
+    if path.suffix != ".npz":
+        raise ValueError("Only .npz datasets are supported.")
+
+    with np.load(path, allow_pickle=False) as data:
         if "X" not in data:
-            raise ValueError(
-                "The dataset file must contain "
-                "an array named 'X'."
-            )
-        
-        X = data["X"]
-        y = data["y"] if y in data else None
-    
-    return Dataset(
-        X=X,
-        y=y
-    )
+            raise ValueError("The dataset must contain an array named X.")
+
+        X = data["X"].copy()
+        y = data["y"].copy() if "y" in data else None
+
+    return Dataset(X, y)
+
 
 def extract_patches(
     image: np.ndarray,
     patch_size: int = 5,
     padding_mode: str = "reflect",
 ) -> np.ndarray:
-    """
-    Extract one square patch centered at each image pixel.
+    image = np.asarray(image, dtype=float)
 
-    The patches are flattened into feature vectors.
+    if image.ndim not in (2, 3) or image.size == 0:
+        raise ValueError("image must be a non-empty grayscale or color image.")
 
-    Parameters
-    ----------
-    image : np.ndarray
-        Grayscale image of shape (H, W) or
-        color image of shape (H, W, C).
+    if not np.all(np.isfinite(image)):
+        raise ValueError("image must contain finite values.")
 
-    patch_size : int
-        Odd patch width.
+    if not isinstance(patch_size, (int, np.integer)):
+        raise TypeError("patch_size must be an integer.")
 
-    padding_mode : str
-        NumPy padding mode used at image boundaries.
-
-    Returns
-    -------
-    np.ndarray
-        Patch feature matrix of shape
-
-            (H * W, patch_dimension).
-    """
-
-    image = np.asarray(
-        image,
-        dtype=float,
-    )
-
-    if image.ndim not in (2, 3):
-        raise ValueError(
-            "image must have shape (H, W) "
-            "or (H, W, C)."
-        )
-
-    if (
-        patch_size < 1
-        or patch_size % 2 == 0
-    ):
-        raise ValueError(
-            "patch_size must be a positive odd integer."
-        )
-
-    height, width = image.shape[:2]
-
-    radius = patch_size // 2
+    if patch_size < 1 or patch_size % 2 == 0:
+        raise ValueError("patch_size must be a positive odd integer.")
 
     if image.ndim == 2:
+        image = image[:, :, None]
 
-        padded = np.pad(
-            image,
-            (
-                (radius, radius),
-                (radius, radius),
-            ),
-            mode=padding_mode,
-        )
-
-        windows = sliding_window_view(
-            padded,
-            (
-                patch_size,
-                patch_size,
-            ),
-        )
-
-        return windows.reshape(
-            height * width,
-            patch_size * patch_size,
-        )
-
-    channels = image.shape[2]
+    height, width, channels = image.shape
+    radius = patch_size // 2
 
     padded = np.pad(
         image,
-        (
-            (radius, radius),
-            (radius, radius),
-            (0, 0),
-        ),
+        ((radius, radius), (radius, radius), (0, 0)),
         mode=padding_mode,
     )
 
     windows = sliding_window_view(
         padded,
-        (
-            patch_size,
-            patch_size,
-        ),
+        (patch_size, patch_size),
         axis=(0, 1),
     )
 
-    # sliding_window_view returns:
-    #
-    # (H, W, C, patch_size, patch_size)
-    #
-    # Reorder into:
-    #
-    # (H, W, patch_size, patch_size, C)
-
-    windows = windows.transpose(
-        0,
-        1,
-        3,
-        4,
-        2,
-    )
+    windows = windows.transpose(0, 1, 3, 4, 2)
 
     return windows.reshape(
         height * width,
-        patch_size
-        * patch_size
-        * channels,
+        patch_size * patch_size * channels,
     )
+

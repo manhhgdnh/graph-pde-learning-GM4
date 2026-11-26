@@ -1,27 +1,37 @@
 import numpy as np
 from scipy.sparse import csr_matrix
 
-from graph import GraphData
+from .graph import GraphData
+
 
 def _validate_values(
     values: np.ndarray,
     graph: GraphData,
 ) -> np.ndarray:
-    """
-    Validate a scalar function defined on graph vertices.
-    """
+    values = np.asarray(values, dtype=float)
 
-    values = np.asarray(
-        values,
-        dtype=float,
-    )
+    if values.shape != (graph.n_nodes,):
+        raise ValueError("values must have shape (n_nodes,).")
 
-    if values.ndim != 1:
-        raise ValueError(
-            "values must be a one-dimensional array."
-        )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("values must contain finite values.")
 
     return values
+
+
+def _validate_p(p: float) -> float:
+    if not np.isscalar(p):
+        raise TypeError("p must be a scalar.")
+
+    p = float(p)
+
+    if p == np.inf:
+        return p
+
+    if not np.isfinite(p) or p < 1:
+        raise ValueError("p must satisfy p >= 1 or p = infinity.")
+
+    return p
 
 
 def _directional_difference(
@@ -29,162 +39,51 @@ def _directional_difference(
     graph: GraphData,
     direction: str,
 ) -> csr_matrix:
-    """
-    Internal implementation of directional differences.
-    """
-
-    values = _validate_values(
-        values,
-        graph,
-    )
-
+    values = _validate_values(values, graph)
     W = graph.weights
 
-    degrees = np.diff(W.indptr)
-
     rows = np.repeat(
-        np.arange(W.shape[0]),
-        degrees,
+        np.arange(graph.n_nodes),
+        np.diff(W.indptr),
     )
 
-    cols = W.indices
-
-    delta = (
-        values[cols]
-        - values[rows]
-    )
+    delta = values[W.indices] - values[rows]
 
     if direction == "plus":
-
-        directional = np.maximum(
-            delta,
-            0.0,
-        )
-
+        delta = np.maximum(delta, 0.0)
     elif direction == "minus":
-
-        directional = np.maximum(
-            -delta,
-            0.0,
-        )
-
+        delta = np.maximum(-delta, 0.0)
     else:
-        raise ValueError(
-            "direction must be 'plus' or 'minus'."
-        )
-
-    data = (
-        np.sqrt(W.data)
-        * directional
-    )
+        raise ValueError("direction must be plus or minus.")
 
     result = csr_matrix(
         (
-            data,
+            np.sqrt(W.data) * delta,
             W.indices.copy(),
             W.indptr.copy(),
         ),
         shape=W.shape,
     )
-
     result.eliminate_zeros()
 
     return result
 
-def difference_plus(
-    values: np.ndarray,
-    graph: GraphData,
-) -> csr_matrix:
-    """
-    Positive/external directional weighted difference.
-    """
 
-    return _directional_difference(
-        values,
-        graph,
-        direction="plus",
-    )
+def difference_plus(values, graph):
+    return _directional_difference(values, graph, "plus")
 
-def difference_minus(
-    values: np.ndarray,
-    graph: GraphData,
-) -> csr_matrix:
-    """
-    Negative/internal directional weighted difference.
-    """
 
-    return _directional_difference(
-        values,
-        graph,
-        direction="minus",
-    )
+def difference_minus(values, graph):
+    return _directional_difference(values, graph, "minus")
 
-def gradient_plus(
-    values: np.ndarray,
-    graph: GraphData,
-) -> csr_matrix:
-    """
-    Compute the external directional gradient.
 
-    For each vertex u,
+def gradient_plus(values, graph):
+    return difference_plus(values, graph)
 
-        grad_w^+(f)(u)
-            = (d_w^+(f)(u, v))_v.
 
-    The gradients of all vertices are stored
-    row-wise in a sparse matrix.
-    """
+def gradient_minus(values, graph):
+    return difference_minus(values, graph)
 
-    return difference_plus(
-        values,
-        graph,
-    )
-
-def gradient_minus(
-    values: np.ndarray,
-    graph: GraphData,
-) -> csr_matrix:
-    """
-    Compute the internal directional gradient.
-
-    For each vertex u,
-
-        grad_w^-(f)(u)
-            = (d_w^-(f)(u, v))_v.
-
-    The gradients of all vertices are stored
-    row-wise in a sparse matrix.
-    """
-
-    return difference_minus(
-        values,
-        graph,
-    )
-
-def _directional_gradient(
-    values: np.ndarray,
-    graph: GraphData,
-    direction: str,
-) -> csr_matrix:
-    """
-    Return the selected directional gradient.
-    """
-
-    if direction == "plus":
-        return gradient_plus(
-            values,
-            graph,
-        )
-
-    if direction == "minus":
-        return gradient_minus(
-            values,
-            graph,
-        )
-
-    raise ValueError(
-        "direction must be 'plus' or 'minus'."
-    )
 
 def gradient_norm(
     values: np.ndarray,
@@ -192,336 +91,160 @@ def gradient_norm(
     p: float = 2.0,
     direction: str = "plus",
 ) -> np.ndarray:
-    """
-    Compute the Lp norm of a directional graph gradient.
+    p = _validate_p(p)
+    gradient = _directional_difference(values, graph, direction)
 
-    Parameters
-    ----------
-    values : np.ndarray
-        Scalar values defined on graph vertices.
+    norms = np.zeros(graph.n_nodes)
 
-    graph : GraphData
-        Weighted graph.
-
-    p : float
-        Norm exponent. Must satisfy p >= 1,
-        or be np.inf.
-
-    direction : {"plus", "minus"}
-        Directional gradient to use.
-
-    Returns
-    -------
-    np.ndarray
-        One gradient norm value per graph vertex.
-    """
-
-    if not (
-        np.isscalar(p)
-        or p is np.inf
-    ):
-        raise TypeError(
-            "p must be a scalar."
-        )
-
-    if not (
-        np.isinf(p)
-        or (
-            np.isfinite(p)
-            and p >= 1.0
-        )
-    ):
-        raise ValueError(
-            "p must satisfy p >= 1 "
-            "or p = infinity."
-        )
-
-    gradient = _directional_gradient(
-        values,
-        graph,
-        direction,
-    )
-
-    n_nodes = gradient.shape[0]
-
-    if np.isinf(p):
-
-        norms = np.zeros(
-            n_nodes,
-            dtype=float,
-        )
-
-        for u in range(n_nodes):
-
+    if p == np.inf:
+        for u in range(graph.n_nodes):
             start = gradient.indptr[u]
             end = gradient.indptr[u + 1]
 
             if start < end:
-                norms[u] = np.max(np.abs(gradient.data[start:end]))
+                norms[u] = gradient.data[start:end].max()
 
-        return norms
+    else:
+        rows = np.repeat(
+            np.arange(graph.n_nodes),
+            np.diff(gradient.indptr),
+        )
+        sums = np.bincount(
+            rows,
+            weights=gradient.data ** p,
+            minlength=graph.n_nodes,
+        )
+        norms = sums ** (1.0 / p)
 
-    powered = gradient.copy()
+    if not np.all(np.isfinite(norms)):
+        raise FloatingPointError("Gradient norms overflowed.")
 
-    powered.data = (np.abs(powered.data) ** p)
+    return norms
 
-    sums = np.asarray(powered.sum(axis=1)).ravel()
-
-    return sums ** (1.0 / p)
 
 def p_laplacian(
     values: np.ndarray,
     graph: GraphData,
     p: float = 2.0,
 ) -> np.ndarray:
-    """
-    Compute Toutain's anisotropic graph p-Laplacian.
+    values = _validate_values(values, graph)
+    p = _validate_p(p)
 
-    For each vertex u,
-
-        Delta^a_{w,p} f(u)
-            = sum_{v ~ u}
-              w_uv^(p/2)
-              |f(v) - f(u)|^(p-2)
-              (f(v) - f(u)).
-
-    The implementation uses the equivalent form
-
-        sign(delta) * |delta|^(p-1)
-
-    with sign(0) = 0.
-
-    Parameters
-    ----------
-    values : np.ndarray
-        Scalar function defined on graph vertices.
-
-    graph : GraphData
-        Weighted undirected graph.
-
-    p : float
-        Exponent satisfying 1 <= p < infinity.
-
-    Returns
-    -------
-    np.ndarray
-        p-Laplacian value at every graph vertex.
-    """
-
-    values = _validate_values(
-        values,
-        graph,
-    )
-
-    if not np.isscalar(p):
-        raise TypeError(
-            "p must be a scalar."
-        )
-
-    if (
-        not np.isfinite(p)
-        or p < 1.0
-    ):
-        raise ValueError(
-            "p must satisfy 1 <= p < infinity."
-        )
+    if p == np.inf:
+        raise ValueError("Use infinity_laplacian for p = infinity.")
 
     W = graph.weights
 
-    n_nodes = W.shape[0]
-
-    degrees = np.diff(W.indptr)
-
     rows = np.repeat(
-        np.arange(n_nodes),
-        degrees,
+        np.arange(graph.n_nodes),
+        np.diff(W.indptr),
     )
-
-    cols = W.indices
-
-    if W.nnz == 0:
-        return np.zeros(
-            n_nodes,
-            dtype=float,
-        )
-
-    delta = (
-        values[cols]
-        - values[rows]
-    )
-
-    nonlinear_difference = (
-        np.sign(delta)
-        * np.abs(delta) ** (p - 1.0)
-    )
+    delta = values[W.indices] - values[rows]
 
     terms = (
         W.data ** (p / 2.0)
-        * nonlinear_difference
+        * np.sign(delta)
+        * np.abs(delta) ** (p - 1.0)
     )
 
-    result = np.bincount(
+    return np.bincount(
         rows,
         weights=terms,
-        minlength=n_nodes,
+        minlength=graph.n_nodes,
     )
 
-    return result
 
 def infinity_laplacian(
     values: np.ndarray,
     graph: GraphData,
 ) -> np.ndarray:
-    """
-    Compute the graph infinity-Laplacian used by Toutain.
+    plus = gradient_norm(values, graph, np.inf, "plus")
+    minus = gradient_norm(values, graph, np.inf, "minus")
 
-    For each vertex u,
+    return 0.5 * (plus - minus)
 
-        Delta_{w,inf} f(u)
-            = 1/2 * (
-                ||grad_w^+ f(u)||_inf
-                - ||grad_w^- f(u)||_inf
-            ).
-
-    Parameters
-    ----------
-    values : np.ndarray
-        Scalar function defined on graph vertices.
-
-    graph : GraphData
-        Weighted undirected graph.
-
-    Returns
-    -------
-    np.ndarray
-        Infinity-Laplacian value at every graph vertex.
-    """
-
-    values = _validate_values(
-        values,
-        graph,
-    )
-
-    plus_norm = gradient_norm(
-        values,
-        graph,
-        p=np.inf,
-        direction="plus",
-    )
-
-    minus_norm = gradient_norm(
-        values,
-        graph,
-        p=np.inf,
-        direction="minus",
-    )
-
-    return 0.5 * (
-        plus_norm
-        - minus_norm
-    )
 
 def mean_curvature(
     values: np.ndarray,
     graph: GraphData,
 ) -> np.ndarray:
-    """
-    Compute the graph mean curvature used by Toutain.
-
-    For every non-isolated vertex u,
-
-        kappa_w(u, f)
-            =
-            sum_{v ~ u}
-                sqrt(w_uv) * sign(f(v) - f(u))
-            /
-            sum_{v ~ u}
-                sqrt(w_uv),
-
-    with Toutain's convention
-
-        sign(x) = 1   if x >= 0,
-                 -1  if x < 0.
-
-    For isolated vertices, the curvature is defined here as 0.
-
-    Parameters
-    ----------
-    values : np.ndarray
-        Scalar function defined on graph vertices.
-
-    graph : GraphData
-        Weighted undirected graph.
-
-    Returns
-    -------
-    np.ndarray
-        Mean curvature at every graph vertex.
-    """
-
-    values = _validate_values(
-        values,
-        graph,
-    )
-
+    values = _validate_values(values, graph)
     W = graph.weights
-    n_nodes = W.shape[0]
-
-    if W.nnz == 0:
-        return np.zeros(
-            n_nodes,
-            dtype=float,
-        )
-
-    degrees = np.diff(W.indptr)
 
     rows = np.repeat(
-        np.arange(n_nodes),
-        degrees,
+        np.arange(graph.n_nodes),
+        np.diff(W.indptr),
     )
+    delta = values[W.indices] - values[rows]
+    roots = np.sqrt(W.data)
 
-    cols = W.indices
-
-    delta = (
-        values[cols]
-        - values[rows]
-    )
-
-    # Important:
-    # Toutain defines sign(0) = +1.
-
-    signs = np.where(
-        delta >= 0.0,
-        1.0,
-        -1.0,
-    )
-
-    sqrt_weights = np.sqrt(
-        W.data
-    )
+    # Toutain uses sign(0) = 1 for this curvature.
+    signs = np.where(delta >= 0.0, 1.0, -1.0)
 
     numerator = np.bincount(
         rows,
-        weights=sqrt_weights * signs,
-        minlength=n_nodes,
+        weights=roots * signs,
+        minlength=graph.n_nodes,
     )
-
     denominator = np.bincount(
         rows,
-        weights=sqrt_weights,
-        minlength=n_nodes,
+        weights=roots,
+        minlength=graph.n_nodes,
     )
 
-    curvature = np.zeros(
-        n_nodes,
-        dtype=float,
-    )
+    curvature = np.zeros(graph.n_nodes)
+    valid = denominator > 0
 
-    non_isolated = (denominator > 0.0)
-
-    curvature[non_isolated] = (
-        numerator[non_isolated]
-        / denominator[non_isolated]
-    )
+    curvature[valid] = numerator[valid] / denominator[valid]
 
     return curvature
+
+
+def normalized_p_laplacian(
+    values: np.ndarray,
+    graph: GraphData,
+    p: float = 2.0,
+) -> np.ndarray:
+    values = _validate_values(values, graph)
+    p = _validate_p(p)
+
+    if np.any(graph.weights.data > 1.0):
+        raise ValueError(
+            "This statistical normalization requires weights <= 1."
+        )
+
+    mean = values.copy()
+    median = values.copy()
+
+    for u in range(graph.n_nodes):
+        neighbors, weights = graph.neighbors(u)
+
+        if neighbors.size == 0:
+            continue
+
+        mean[u] = np.dot(weights, values[neighbors]) / weights.sum()
+
+        differences = np.sqrt(weights) * (
+            values[neighbors] - values[u]
+        )
+        median[u] = values[u] + np.median(differences)
+
+    if p <= 2:
+        mean_coefficient = 2.0 * (p - 1.0) / p
+        median_coefficient = (2.0 - p) / p
+
+        return (
+            mean_coefficient * (mean - values)
+            + median_coefficient * (median - values)
+        )
+
+    midrange_difference = infinity_laplacian(values, graph)
+
+    if p == np.inf:
+        return midrange_difference
+
+    return (
+        (2.0 / p) * (mean - values)
+        + ((p - 2.0) / p) * midrange_difference
+    )
+
